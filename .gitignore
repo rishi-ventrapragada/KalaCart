@@ -38,3 +38,4 @@ dist/
 .DS_Store
 __MACOSX/
 Thumbs.db
+analysis_*.txt
