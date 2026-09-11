@@ -1,0 +1,40 @@
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
+*.iml
+.idea/
+ios/Flutter/Generated.xcconfig
+ios/Flutter/flutter_export_environment.sh
+ios/Flutter/ephemeral/
+
+# Android / Gradle
+.gradle/
+local.properties
+*.apk
+*.jks
+*.keystore
+google-services.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+venv/
+.venv/
+
+# Secrets — never commit
+.env
+backend/.env
+web/.env.local
+
+# Node
+node_modules/
+dist/
+
+# OS
+.DS_Store
+__MACOSX/
+Thumbs.db
