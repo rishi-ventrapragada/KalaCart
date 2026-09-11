@@ -162,11 +162,20 @@ async def health_check():
 # routers define `APIRouter()` without internal prefix and are mounted with
 # `prefix="/api/v1/<domain>"` below.
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["Auth"])
-app.include_router(
-    agent.router,
-    prefix="/api/v1/agent",
-    tags=["Unified Artisan Agent"],
-)
+# SUPERSEDED — the unified artisan agent route is deliberately NOT mounted.
+# Decision D-10: the three AI features are served by the dedicated endpoints
+# below (/catalog/voice, /pricing/analyze, /image/enhance), which are the only
+# live path. The agent could not satisfy the voice requirement on its own: it
+# accepts a transcript string and has no speech-to-text stage.
+# The code stays in app/agent/ — its free-model fallback walker
+# (app/agent/models.py) has no equivalent elsewhere and is worth keeping.
+# Re-mounting it would create a second, competing implementation of the same
+# three features; do not re-enable without revisiting D-10.
+# app.include_router(
+#     agent.router,
+#     prefix="/api/v1/agent",
+#     tags=["Unified Artisan Agent"],
+# )
 app.include_router(catalog.router, prefix="/api/v1/catalog", tags=["Catalog"])
 app.include_router(pricing.router, prefix="/api/v1/pricing", tags=["Pricing"])
 app.include_router(image.router, prefix="/api/v1/image", tags=["Image"])

@@ -309,21 +309,127 @@ def white_balance_simple(img: np.ndarray) -> np.ndarray:
         return img.copy()
 
 
-def enhance_image(img: np.ndarray) -> np.ndarray:
-    """
-    Orchestrate full enhancement pipeline.
+def _valid_mask(mask, img: np.ndarray, min_pixels: int = 100) -> bool:
+    """True if mask is a single-channel array matching img with enough foreground pixels."""
+    return (
+        isinstance(mask, np.ndarray)
+        and mask.shape == img.shape[:2]
+        and int(np.count_nonzero(mask > 127)) >= min_pixels
+    )
 
-    Order (as per spec):
-        1. auto_brightness_normalization (target_mean=180)
-        2. CLAHE (LAB L-channel)
-        3. bilateral_denoise
-        4. unsharp_mask + white_balance_simple
+
+def auto_exposure(
+    img: np.ndarray,
+    mask: np.ndarray | None = None,
+    target_median: int = 150,
+) -> np.ndarray:
+    """
+    Correct exposure on the LAB lightness channel only, so colours are untouched.
+
+    Lifts the white point (99.5th percentile) to near full scale, then applies a gamma
+    so the product's median lightness lands near target_median. When a mask is given,
+    the median is measured on the product — a bright backdrop then no longer makes the
+    product look underexposed (unlike a whole-frame mean).
+
+    Args:
+        img: BGR np.ndarray (uint8).
+        mask: Optional uint8 mask (H x W), 255 = product.
+        target_median: Desired product median lightness (0-255, default 150).
+
+    Returns:
+        Exposure-corrected BGR np.ndarray.
+    """
+    try:
+        _validate_bgr(img)
+    except ValueError as e:
+        logger.warning("auto_exposure validation failed: %s — returning original", e)
+        return img
+
+    try:
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        lightness = lab[:, :, 0].astype(np.float32)
+        hi = float(np.percentile(lightness, 99.5))
+        if hi < 10:
+            return img.copy()
+
+        # White point only — also stretching the black point crushes dark weaves and
+        # mid-tone products, whose darkest threads would map to pure black
+        stretched = np.clip(lightness * (250.0 / hi), 0, 255) if hi < 250 else lightness
+        metered = stretched[mask > 127] if _valid_mask(mask, img) else stretched
+        median = float(np.median(metered))
+        if 1.0 < median < 254.0:
+            gamma = float(np.clip(np.log(target_median / 255.0) / np.log(median / 255.0), 0.6, 1.6))
+            stretched = 255.0 * (stretched / 255.0) ** gamma
+
+        lab[:, :, 0] = np.clip(stretched, 0, 255).astype(np.uint8)
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    except Exception as exc:
+        logger.warning("auto_exposure failed: %s — returning original", exc)
+        return img.copy()
+
+
+def white_balance_from_background(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Remove a colour cast using the background pixels, which are usually a neutral wall,
+    sheet or table. Unlike gray-world balancing, this never pulls a saturated product
+    (red saree, indigo block print) toward grey. Skipped when the backdrop itself is
+    clearly coloured, since correcting it would tint the product.
+
+    Args:
+        img: BGR np.ndarray (uint8).
+        mask: uint8 mask (H x W), 255 = product, 0 = background.
+
+    Returns:
+        White-balanced BGR np.ndarray (copy of input when skipped).
+    """
+    try:
+        _validate_bgr(img)
+    except ValueError as e:
+        logger.warning("white_balance_from_background validation failed: %s — returning original", e)
+        return img
+
+    try:
+        if not isinstance(mask, np.ndarray) or mask.shape != img.shape[:2]:
+            return img.copy()
+        background = img[mask < 128]
+        if background.shape[0] < 500:
+            return img.copy()
+
+        lab_bg = cv2.cvtColor(background.reshape(-1, 1, 3), cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
+        chroma = float(np.hypot(np.median(lab_bg[:, 1]) - 128.0, np.median(lab_bg[:, 2]) - 128.0))
+        if chroma > 25.0:
+            logger.debug("white_balance_from_background: coloured backdrop (chroma=%.1f) — skipping", chroma)
+            return img.copy()
+
+        means = background.reshape(-1, 3).astype(np.float32).mean(axis=0)
+        if float(means.min()) < 1.0:
+            return img.copy()
+        scales = np.clip(means.mean() / means, 0.8, 1.25)
+        if np.all(np.abs(scales - 1.0) < 0.03):
+            return img.copy()
+        return np.clip(img.astype(np.float32) * scales, 0, 255).astype(np.uint8)
+    except Exception as exc:
+        logger.warning("white_balance_from_background failed: %s — returning original", exc)
+        return img.copy()
+
+
+def enhance_image(img: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+    """
+    Orchestrate full enhancement pipeline, tuned for textiles and handicrafts.
+
+    Order:
+        1. auto_exposure (lightness only, metered on the product when mask given)
+        2. CLAHE (LAB L-channel, gentle clip so fabric doesn't look crunchy)
+        3. bilateral_denoise (light, preserves weave / embroidery texture)
+        4. unsharp_mask + white_balance_from_background (only when a mask is given —
+           without a background reference, balancing would shift product colours)
 
     Each step is wrapped in try/except so a single failure does not abort the chain.
     Returns enhanced BGR image. If all steps fail, returns a copy of original.
 
     Args:
         img: BGR np.ndarray (uint8).
+        mask: Optional uint8 foreground mask (H x W), 255 = product.
 
     Returns:
         Enhanced BGR np.ndarray.
@@ -338,35 +444,37 @@ def enhance_image(img: np.ndarray) -> np.ndarray:
         raise
 
     result = img.copy()
+    use_mask = mask if _valid_mask(mask, img) else None
 
-    # Step 1: Brightness normalization — bring mean toward studio bright 180
+    # Step 1: Exposure — lightness only, so product colours are preserved
     try:
-        result = auto_brightness_normalization(result, target_mean=180)
+        result = auto_exposure(result, mask=use_mask, target_median=150)
     except Exception as exc:
-        logger.warning("enhance_image: brightness step failed: %s", exc)
+        logger.warning("enhance_image: exposure step failed: %s", exc)
 
     # Step 2: CLAHE for local contrast
     try:
-        result = apply_clahe(result, clipLimit=2.0, tileGridSize=(8, 8))
+        result = apply_clahe(result, clipLimit=1.5, tileGridSize=(8, 8))
     except Exception as exc:
         logger.warning("enhance_image: CLAHE step failed: %s", exc)
 
-    # Step 3: Denoise before sharpening (avoid amplifying noise)
+    # Step 3: Light denoise before sharpening — strong bilateral filtering smears fabric texture
     try:
-        result = bilateral_denoise(result, d=9, sigmaColor=75, sigmaSpace=75)
+        result = bilateral_denoise(result, d=5, sigmaColor=35, sigmaSpace=35)
     except Exception as exc:
         logger.warning("enhance_image: bilateral step failed: %s", exc)
 
-    # Step 4a: Unsharp mask sharpening
+    # Step 4a: Unsharp mask sharpening (threshold skips flat areas to avoid noise)
     try:
-        result = unsharp_mask(result, amount=0.5, radius=1.0, threshold=0)
+        result = unsharp_mask(result, amount=0.6, radius=1.2, threshold=3)
     except Exception as exc:
         logger.warning("enhance_image: unsharp step failed: %s", exc)
 
-    # Step 4b: White balance — after sharpening so colors are balanced last
-    try:
-        result = white_balance_simple(result)
-    except Exception as exc:
-        logger.warning("enhance_image: white_balance step failed: %s", exc)
+    # Step 4b: White balance from the background — after sharpening so colors are balanced last
+    if use_mask is not None:
+        try:
+            result = white_balance_from_background(result, use_mask)
+        except Exception as exc:
+            logger.warning("enhance_image: white_balance step failed: %s", exc)
 
     return result

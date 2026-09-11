@@ -233,9 +233,8 @@ async def check_supabase_health() -> Dict[str, Any]:
     start = time.monotonic()
     try:
         client = get_supabase_client()
-        # Lightweight query — count artisans with limit 1 (does not require table to have data)
-        # Use head via limit to avoid large payload
-        client.table("artisans").select("id").limit(1).execute()
+        # Lightweight query on profiles (the live user table) with limit 1 — works on an empty table
+        client.table("profiles").select("id").limit(1).execute()
         elapsed_ms = (time.monotonic() - start) * 1000
         return {
             "status": "healthy",

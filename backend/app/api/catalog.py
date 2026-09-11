@@ -2,12 +2,18 @@
 Catalog API — Smart Catalog Generation via Qwen 3 / OpenRouter.
 
 POST /api/v1/catalog/generate
-- Auth required (Bearer Firebase token via get_current_user)
+- Auth required (Bearer Supabase / Firebase token via get_current_user)
 - Rate limit: 10 req / 60s per IP-or-artisan (in-memory window)
 - Input: transcript (5-1000 chars, control chars stripped), language te|hi|en|ta|kn
-- Calls OpenRouter qwen/qwen3-32b with catalog_system.md prompt, temperature 0.7, max_tokens 800, timeout 30s
+- Calls OpenRouter QWEN_MODEL (default qwen/qwen3.6-flash) with catalog_system.md prompt, temperature 0.3,
+  max_tokens 1500, thinking disabled (with thinking on, Qwen 3 took ~60s and blew the timeout), timeout 45s
 - Validates JSON schema, retry once on malformed, 502 on persistent failure
 - Never exposes OPENROUTER_API_KEY in response/logs
+
+POST /api/v1/catalog/voice
+- Same auth / rate limit. Multipart: audio (voice note, <=30s, <=5 MB) + language (te|hi|en|ta|kn|auto)
+- Transcribes with Sarvam AI (app.ai.speech), then runs the same catalog generation
+- Returns the catalog fields plus transcript and detected_language
 
 Do NOT modify Camera Studio. Do NOT implement pricing/marketplace.
 """
@@ -21,9 +27,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from pydantic import BaseModel, Field, field_validator
 
+from app.ai.speech import MAX_AUDIO_BYTES, SUPPORTED_AUDIO_TYPES, transcribe_audio
 from app.core.config import get_settings
 from app.core.security import get_current_user
 
@@ -44,6 +51,10 @@ ALLOWED_CATEGORIES = [
     "Other",
 ]
 ALLOWED_LANGUAGES = ["te", "hi", "en", "ta", "kn"]
+VOICE_LANGUAGES = ALLOWED_LANGUAGES + ["auto"]
+
+# 80-150 English words run ~500-1000 characters; Hindi in Devanagari runs similar
+DESCRIPTION_MAX_CHARS = 1200
 
 _RATE_LIMIT_MAX = 10
 _RATE_LIMIT_WINDOW_SECONDS = 60
@@ -156,6 +167,16 @@ class GenerateCatalogResponse(BaseModel):
     data: CatalogData
 
 
+class VoiceCatalogData(CatalogData):
+    transcript: str
+    detected_language: Optional[str] = None
+
+
+class VoiceCatalogResponse(BaseModel):
+    success: bool = True
+    data: VoiceCatalogData
+
+
 # ── Validation & parsing helpers (mirror app/ai/catalog.py) ────────────
 
 def _strip_code_fences(text: str) -> str:
@@ -184,11 +205,11 @@ def _validate_catalog_schema(data: Dict[str, Any]) -> tuple[bool, str]:
     if not isinstance(title, str) or not (5 <= len(title.strip()) <= 80):
         return False, "title must be string 5-80 chars"
     de = data.get("description_en")
-    if not isinstance(de, str) or not (20 <= len(de.strip()) <= 500):
-        return False, "description_en must be string 20-500 chars"
+    if not isinstance(de, str) or not (20 <= len(de.strip()) <= DESCRIPTION_MAX_CHARS):
+        return False, f"description_en must be string 20-{DESCRIPTION_MAX_CHARS} chars"
     dh = data.get("description_hi")
-    if not isinstance(dh, str) or not (20 <= len(dh.strip()) <= 500):
-        return False, "description_hi must be string 20-500 chars"
+    if not isinstance(dh, str) or not (20 <= len(dh.strip()) <= DESCRIPTION_MAX_CHARS):
+        return False, f"description_hi must be string 20-{DESCRIPTION_MAX_CHARS} chars"
     cat = data.get("category")
     if cat not in ALLOWED_CATEGORIES:
         return False, f"category must be one of {ALLOWED_CATEGORIES}"
@@ -218,7 +239,8 @@ def _load_system_prompt() -> str:
     fallback = (
         "You are KalaCart's Smart Catalog Assistant (Qwen 3). "
         "Preserve artisan meaning, never invent materials, generate concise professional English (80-150 words), "
-        "natural Hindi (Devanagari, preserve cultural terms), return valid JSON only with schema "
+        "natural Hindi (Devanagari, preserve cultural terms), always write the title in English, "
+        "return valid JSON only with schema "
         "{title, description_en, description_hi, category, materials[], seo_tags[], care}. "
         "Categories allowed: [Textiles, Pottery, Woodwork, Metalwork, Jewelry, Painting, Basketry, Leather, Other]. "
         "Return JSON only, no markdown. "
@@ -245,7 +267,7 @@ async def _call_openrouter(
     settings = get_settings()
     api_key = settings.OPENROUTER_API_KEY or os.getenv("OPENROUTER_API_KEY")
     base_url = settings.OPENROUTER_BASE_URL or os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-    model = settings.QWEN_MODEL or os.getenv("QWEN_MODEL", "qwen/qwen3-32b")
+    model = settings.QWEN_MODEL or os.getenv("QWEN_MODEL", "qwen/qwen3.6-flash")
 
     if not api_key:
         logger.error("OPENROUTER_API_KEY not configured")
@@ -263,8 +285,8 @@ async def _call_openrouter(
             "{title, description_en, description_hi, category, materials[], seo_tags[], care} "
             "with no markdown, no code fences, no commentary. "
             "Categories allowed: [Textiles, Pottery, Woodwork, Metalwork, Jewelry, Painting, Basketry, Leather, Other]. "
-            "Title 5-80 chars, description_en 20-500 (80-150 words), description_hi 20-500, "
-            "materials 1-5 strings, seo_tags 2-5 strings, care 5-200."
+            f"Title 5-80 chars in English, description_en 20-{DESCRIPTION_MAX_CHARS} chars (80-150 words), "
+            f"description_hi 20-{DESCRIPTION_MAX_CHARS} chars, materials 1-5 strings, seo_tags 2-5 strings, care 5-200."
         )
 
     user_content = (
@@ -285,15 +307,19 @@ async def _call_openrouter(
             {"role": "system", "content": sys_content},
             {"role": "user", "content": user_content},
         ],
-        "temperature": 0.7,
-        "max_tokens": 800,
+        # Low temperature keeps materials and facts faithful to the transcript
+        "temperature": 0.3,
+        # Devanagari is token-heavy; 800 truncated longer English + Hindi descriptions
+        "max_tokens": 1500,
+        # "Thinking" adds hundreds of hidden tokens and tens of seconds without better listings
+        "reasoning": {"enabled": False},
     }
 
     url = f"{base_url.rstrip('/')}/chat/completions"
     logger.debug("OpenRouter call model=%s (key redacted) retry=%s", model, is_retry)
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=45) as client:
             response = await client.post(url, headers=headers, json=payload)
             # Raise for 4xx/5xx
             try:
@@ -337,7 +363,81 @@ async def _call_openrouter(
         ) from exc
 
 
-# ── Route ──────────────────────────────────────────────────────────────
+def _normalize_catalog(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize whitespace of free-text fields for the response."""
+    for key in ("title", "description_en", "description_hi", "care"):
+        data[key] = data[key].strip()
+    return data
+
+
+async def _generate_catalog(transcript: str, language: str, artisan_uid: str) -> Dict[str, Any]:
+    """
+    Generate a validated catalog entry from a transcript.
+
+    Calls the LLM, strips markdown fences, parses and validates JSON, and retries once with a
+    strict instruction on invalid output. Raises HTTPException 502/504 on persistent failure.
+    """
+    system_prompt = _load_system_prompt()
+
+    # ── First attempt ───────────────────────────────────────────────
+    try:
+        raw = await _call_openrouter(system_prompt, transcript, language, is_retry=False)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Unexpected error calling LLM (key redacted): %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="LLM returned malformed JSON",
+        ) from exc
+
+    stripped = _strip_code_fences(raw)
+    try:
+        data = json.loads(stripped)
+        valid, err_msg = _validate_catalog_schema(data)
+        if valid:
+            logger.info("Catalog generate success on first attempt category=%s", data.get("category"))
+            return _normalize_catalog(data)
+        logger.warning("First LLM output schema invalid: %s", err_msg)
+    except json.JSONDecodeError as exc:
+        logger.warning("First LLM output invalid JSON: %s — preview: %s", exc, stripped[:400])
+
+    # ── Retry once ──────────────────────────────────────────────────
+    logger.info("Retrying catalog generation with strict JSON instruction (uid=%s)", artisan_uid)
+    try:
+        raw_retry = await _call_openrouter(system_prompt, transcript, language, is_retry=True)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Unexpected retry error (key redacted): %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="LLM returned malformed JSON",
+        ) from exc
+
+    stripped_retry = _strip_code_fences(raw_retry)
+    try:
+        data_retry = json.loads(stripped_retry)
+    except json.JSONDecodeError as exc:
+        logger.error("Retry LLM output still invalid JSON: %s — raw preview: %s", exc, stripped_retry[:500])
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="LLM returned malformed JSON",
+        ) from exc
+
+    valid_retry, err_retry = _validate_catalog_schema(data_retry)
+    if not valid_retry:
+        logger.error("Retry LLM output schema invalid: %s — data preview: %s", err_retry, str(data_retry)[:500])
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="LLM returned malformed JSON",
+        )
+
+    logger.info("Catalog generate success on retry category=%s", data_retry.get("category"))
+    return _normalize_catalog(data_retry)
+
+
+# ── Routes ─────────────────────────────────────────────────────────────
 
 @router.post(
     "/generate",
@@ -347,7 +447,7 @@ async def _call_openrouter(
     description=(
         "Auth required. Rate limited 10/min per artisan/IP. "
         "Translates + SEO in single Qwen3 call. Validates JSON schema with one retry. "
-        "Uses OPENROUTER_API_KEY, model qwen/qwen3-32b, base https://openrouter.ai/api/v1/chat/completions."
+        "Uses OPENROUTER_API_KEY and QWEN_MODEL (default qwen/qwen3.6-flash) via https://openrouter.ai/api/v1/chat/completions."
     ),
 )
 async def generate_catalog(
@@ -383,80 +483,77 @@ async def generate_catalog(
         rate_key,
     )
 
-    system_prompt = _load_system_prompt()
+    data = await _generate_catalog(transcript, language, artisan_uid)
+    return {"success": True, "data": data}
 
-    # ── First attempt ───────────────────────────────────────────────
-    try:
-        raw = await _call_openrouter(system_prompt, transcript, language, is_retry=False)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error("Unexpected error calling LLM (key redacted): %s", exc, exc_info=True)
+
+@router.post(
+    "/voice",
+    response_model=VoiceCatalogResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Generate catalog entry from an artisan voice note",
+    description=(
+        "Auth required. Rate limited 10/min per artisan/IP (shared with /generate). "
+        "Multipart: audio (wav/mp3/m4a/aac/ogg/opus/webm/flac/amr, up to ~30 seconds, max 5 MB) and "
+        "language (te|hi|en|ta|kn, or auto to detect). Transcribes with Sarvam AI, then generates an "
+        "SEO-friendly listing in English and Hindi. Response includes the transcript and detected language."
+    ),
+)
+async def generate_catalog_from_voice(
+    request: Request,
+    audio: UploadFile = File(..., description="Voice note describing the product"),
+    language: str = Form(default="auto", description="Spoken language: te|hi|en|ta|kn|auto"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    rate_key = _get_rate_limit_key(request, current_user)
+    _check_rate_limit(rate_key)
+
+    language = (language or "auto").strip().lower()
+    if language not in VOICE_LANGUAGES:
         raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="LLM returned malformed JSON",
-        ) from exc
-
-    stripped = _strip_code_fences(raw)
-    data: Optional[Dict[str, Any]] = None
-    valid = False
-    err_msg = ""
-
-    try:
-        data = json.loads(stripped)
-        valid, err_msg = _validate_catalog_schema(data)
-        if not valid:
-            logger.warning("First LLM output schema invalid: %s", err_msg)
-            data = None
-    except json.JSONDecodeError as exc:
-        logger.warning("First LLM output invalid JSON: %s — preview: %s", exc, stripped[:400])
-        data = None
-
-    if data is not None and valid:
-        # Normalize whitespace for response
-        data["title"] = data["title"].strip()
-        data["description_en"] = data["description_en"].strip()
-        data["description_hi"] = data["description_hi"].strip()
-        data["care"] = data["care"].strip()
-        logger.info("Catalog generate success on first attempt category=%s", data.get("category"))
-        return {"success": True, "data": data}
-
-    # ── Retry once ──────────────────────────────────────────────────
-    logger.info("Retrying catalog generation with strict JSON instruction (uid=%s)", artisan_uid)
-    try:
-        raw_retry = await _call_openrouter(system_prompt, transcript, language, is_retry=True)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error("Unexpected retry error (key redacted): %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="LLM returned malformed JSON",
-        ) from exc
-
-    stripped_retry = _strip_code_fences(raw_retry)
-    try:
-        data_retry = json.loads(stripped_retry)
-    except json.JSONDecodeError as exc:
-        logger.error("Retry LLM output still invalid JSON: %s — raw preview: %s", exc, stripped_retry[:500])
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="LLM returned malformed JSON",
-        ) from exc
-
-    valid_retry, err_retry = _validate_catalog_schema(data_retry)
-    if not valid_retry:
-        logger.error("Retry LLM output schema invalid: %s — data preview: %s", err_retry, str(data_retry)[:500])
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="LLM returned malformed JSON",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"language must be one of {', '.join(VOICE_LANGUAGES)}",
         )
 
-    # Success on retry
-    data_retry["title"] = data_retry["title"].strip()
-    data_retry["description_en"] = data_retry["description_en"].strip()
-    data_retry["description_hi"] = data_retry["description_hi"].strip()
-    data_retry["care"] = data_retry["care"].strip()
-    logger.info("Catalog generate success on retry category=%s", data_retry.get("category"))
-    return {"success": True, "data": data_retry}
+    content_type = (audio.content_type or "").split(";")[0].strip().lower()
+    if content_type not in SUPPORTED_AUDIO_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported audio type '{content_type or 'unknown'}'. Use wav, mp3, m4a, aac, ogg, opus, webm, flac or amr",
+        )
 
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Voice note is empty")
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
+        raise HTTPException(
+            status_code=getattr(status, "HTTP_413_CONTENT_TOO_LARGE", 413),
+            detail="Voice note too large — keep it under 30 seconds (max 5 MB)",
+        )
+
+    artisan_uid = current_user.get("firebase_uid", "unknown") if isinstance(current_user, dict) else "unknown"
+    started = time.monotonic()
+    speech = await transcribe_audio(audio_bytes, audio.filename or "voice-note", content_type, language)
+
+    transcript = re.sub(r"[\x00-\x1f\x7f]", " ", speech.get("transcript") or "").strip()[:1000]
+    if len(transcript) < 5:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Couldn't hear a product description in the voice note — speak clearly for a few seconds and try again",
+        )
+
+    # Prefer the language Sarvam detected ("te-IN" -> "te") as the hint for the LLM
+    detected = speech.get("language_code")
+    detected_short = (detected or "").split("-")[0].lower()
+    hint = detected_short if detected_short in ALLOWED_LANGUAGES else (language if language in ALLOWED_LANGUAGES else "en")
+    logger.info(
+        "Voice catalog uid=%s audio_bytes=%d detected=%s transcript_len=%d stt_ms=%d",
+        artisan_uid,
+        len(audio_bytes),
+        detected,
+        len(transcript),
+        int((time.monotonic() - started) * 1000),
+    )
+
+    data = await _generate_catalog(transcript, hint, artisan_uid)
+    return {"success": True, "data": {**data, "transcript": transcript, "detected_language": detected}}

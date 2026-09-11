@@ -23,10 +23,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.ai.vision import extract_product_attributes
 from app.core.config import get_settings
+from app.core.security import get_current_user
+from app.services.pricing_engine import DEFAULT_LABOUR_HOURS, compute_price, seasonal_factor
 
 logger = logging.getLogger(__name__)
 
@@ -337,13 +340,13 @@ def _fetch_seasonal_boost(category: str) -> Optional[SeasonalBoostInfo]:
                     )
     except Exception:
         pass
-    festive_categories = ["Textiles", "Pottery", "Jewelry", "Metalwork", "Painting"]
-    if category in festive_categories:
-        return SeasonalBoostInfo(
-            festival_name="Diwali & Festive Season",
-            multiplier=1.25,
-            is_active=True
-        )
+    # No seasonal data available: use the festival calendar for today's date rather than
+    # reporting a festival boost year-round
+    from datetime import date
+
+    factor, label = seasonal_factor(category, date.today())
+    if factor > 1.0:
+        return SeasonalBoostInfo(festival_name=label, multiplier=factor, is_active=True)
     return None
 
 
@@ -887,4 +890,149 @@ async def suggest_price_alias(
 ):
     """Deprecated alias — calls same handler as /predict."""
     return await _handle_predict(payload, request, current_user)
+
+
+# ── Pricing assistant: product photo + description → explainable price ─
+
+ANALYZE_IMAGE_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
+ANALYZE_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+def _fetch_comparable_prices(category: str) -> List[float]:
+    """Prices of active KalaCart listings in the category (up to 200). Empty list on any error."""
+    try:
+        from app.database.connection import get_supabase_client
+
+        res = (
+            get_supabase_client()
+            .table("products")
+            .select("price")
+            .eq("category", category)
+            .eq("is_active", True)
+            .limit(200)
+            .execute()
+        )
+        return [float(row["price"]) for row in (res.data or []) if isinstance(row.get("price"), (int, float))]
+    except Exception as exc:
+        logger.warning("Comparable price lookup failed for category=%s: %s", category, exc)
+        return []
+
+
+@router.post(
+    "/analyze",
+    status_code=status.HTTP_200_OK,
+    summary="Suggest a price from a product photo and description",
+    description=(
+        "Auth required. Rate limited 20/min per uid/IP (shared with /predict). Multipart: description (required), "
+        "image (optional, jpeg/png/webp up to 10 MB) and optional seller facts that override what the AI reads: "
+        "title, category, materials (comma-separated), material_cost (INR), labour_hours, market_position "
+        "(Budget|Standard|Premium). A vision model (VISION_MODEL) extracts category, materials, size, quality and "
+        "craftsmanship complexity; the price itself is computed from costs, comparable listings (or reference "
+        "ranges) and the festival calendar, and every factor is returned."
+    ),
+)
+async def analyze_price(
+    request: Request,
+    description: str = Form(..., min_length=5, max_length=1500),
+    image: Optional[UploadFile] = File(default=None),
+    title: Optional[str] = Form(default=None, max_length=200),
+    category: Optional[str] = Form(default=None),
+    materials: Optional[str] = Form(default=None, max_length=300),
+    material_cost: Optional[float] = Form(default=None, ge=0, le=1_000_000),
+    labour_hours: Optional[float] = Form(default=None, gt=0, le=500),
+    market_position: str = Form(default="Standard"),
+    size: Optional[str] = Form(default=None, description="Small|Medium|Large"),
+    quality: Optional[str] = Form(default=None, description="Basic|Standard|Premium"),
+    complexity: Optional[int] = Form(default=None, ge=1, le=5, description="Craftsmanship complexity 1-5"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    import asyncio
+    from datetime import date
+
+    _check_rate_limit(_get_rate_limit_key(request, current_user))
+
+    def allowed(value: Optional[str], options: List[str], field: str) -> Optional[str]:
+        if not value or not value.strip():
+            return None
+        normalized = _strip_control(value).title()
+        if normalized not in options:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{field} must be one of {options}",
+            )
+        return normalized
+
+    position = allowed(market_position, ALLOWED_MARKET_POSITIONS, "market_position") or "Standard"
+    seller_category = allowed(category, ALLOWED_CATEGORIES, "category")
+    seller_size = allowed(size, ALLOWED_SIZES, "size")
+    seller_quality = allowed(quality, ALLOWED_QUALITIES, "quality")
+    seller_materials = [m.strip().title() for m in _strip_control(materials or "").split(",") if m.strip()][:5]
+
+    image_bytes: Optional[bytes] = None
+    if image is not None and image.filename:
+        content_type = (image.content_type or "").split(";")[0].strip().lower()
+        if content_type not in ANALYZE_IMAGE_TYPES:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported image type. Use JPEG, PNG or WebP")
+        image_bytes = await image.read() or None
+        if image_bytes and len(image_bytes) > ANALYZE_MAX_IMAGE_BYTES:
+            raise HTTPException(
+                status_code=getattr(status, "HTTP_413_CONTENT_TOO_LARGE", 413),
+                detail="Image too large (max 10 MB)",
+            )
+
+    if seller_category and seller_size and seller_quality and complexity:
+        # Everything the engine needs is already known (e.g. recalculating after the seller changes
+        # costs) — skip the AI call so the price updates instantly and at no cost
+        attributes = {
+            "category": seller_category,
+            "materials": seller_materials,
+            "size": seller_size,
+            "quality": seller_quality,
+            "complexity": complexity,
+            "estimated_labour_hours": None,
+            "observations": "",
+        }
+        image_bytes = None  # not analyzed on this path
+    else:
+        text = _strip_control(description)
+        if title and title.strip():
+            text = f"{_strip_control(title)}. {text}"
+        if seller_materials:
+            text += f" Materials: {', '.join(seller_materials)}."
+
+        attributes = await extract_product_attributes(text, image_bytes)
+        # Facts the seller states override what the model inferred
+        seller_facts = {"category": seller_category, "size": seller_size, "quality": seller_quality, "complexity": complexity}
+        attributes.update({key: value for key, value in seller_facts.items() if value})
+        if seller_materials:
+            attributes["materials"] = seller_materials
+
+    hours = labour_hours or attributes.get("estimated_labour_hours") or DEFAULT_LABOUR_HOURS[attributes["size"]]
+    comparables = await asyncio.to_thread(_fetch_comparable_prices, attributes["category"])
+    result = compute_price(
+        category=attributes["category"],
+        size=attributes["size"],
+        quality=attributes["quality"],
+        complexity=attributes["complexity"],
+        market_position=position,
+        labour_hours=float(hours),
+        material_cost=material_cost,
+        comparable_prices=comparables,
+        today=date.today(),
+        labour_hours_estimated=labour_hours is None,
+        image_analyzed=image_bytes is not None,
+    )
+
+    logger.info(
+        "Pricing analyze uid=%s category=%s suggested=%s market=%s image=%s",
+        current_user.get("uid") or current_user.get("firebase_uid"),
+        attributes["category"],
+        result["suggested_price"],
+        result["market"]["source"],
+        image_bytes is not None,
+    )
+    return {
+        "success": True,
+        "data": {**result, "attributes": attributes, "labour_hours": float(hours), "market_position": position},
+    }
 

@@ -21,6 +21,7 @@ Flow:
 No AI marketplace / voice / catalog / translation / pricing logic here.
 """
 
+import base64
 import io
 import logging
 import os
@@ -29,7 +30,7 @@ from typing import Dict, Any
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
 from fastapi.responses import JSONResponse
 
 from app.core.security import get_current_user
@@ -288,20 +289,65 @@ def _upload_bytes_with_fallback(bucket: str, path: str, data: bytes, content_typ
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Upload succeeded but failed to get public URL: {exc}") from exc
 
 
+def _upload_as_user(bucket: str, access_token: str, files: list[tuple[str, bytes, str]]) -> list[str] | None:
+    """
+    Upload (path, data, content_type) files to Supabase Storage with the end user's access
+    token, so storage RLS applies (users may write only under their own auth-uid folder).
+
+    Returns public URLs in input order, or None if storage is unconfigured or rejects any upload.
+    """
+    import httpx
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    base_url = (settings.SUPABASE_URL or "").rstrip("/")
+    api_key = settings.SUPABASE_KEY
+    if not base_url or not api_key:
+        return None
+
+    urls: list[str] = []
+    try:
+        with httpx.Client(timeout=30) as client:
+            for path, data, content_type in files:
+                resp = client.post(
+                    f"{base_url}/storage/v1/object/{bucket}/{path}",
+                    headers={
+                        "apikey": api_key,
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": content_type,
+                        "x-upsert": "false",
+                    },
+                    content=data,
+                )
+                if resp.status_code >= 300:
+                    logger.warning(
+                        "Storage rejected upload %s/%s: HTTP %s %s", bucket, path, resp.status_code, resp.text[:200]
+                    )
+                    return None
+                urls.append(f"{base_url}/storage/v1/object/public/{bucket}/{path}")
+    except httpx.HTTPError as exc:
+        logger.warning("Storage upload failed for bucket=%s: %s", bucket, exc)
+        return None
+    return urls
+
+
 @router.post(
     "/enhance",
     summary="Enhance product image (background removal + CLAHE + compose on white)",
     description=(
-        "Auth required. Form-data: image (file) + output_format ('1:1' or '4:5'). "
+        "Auth required. Form-data: image (file) + output_format ('1:1' or '4:5') + enhance (bool, default true). "
         "Validates file size, MIME, extension, path traversal, executable blocks, and dimensions "
         "BEFORE running pipeline. Uploads original + enhanced PNG/WebP + thumbnail to Supabase Storage. "
-        "Returns public URLs."
+        "Returns public URLs (or the enhanced image inline as a data URL if storage rejects the upload)."
     ),
     status_code=200,
 )
 async def enhance_image(
     image: UploadFile = File(..., description="Image file (jpeg/png/webp, max 10MB)"),
     output_format: str = Form(default="1:1", description="Output aspect ratio: 1:1 or 4:5"),
+    enhance: bool = Form(default=True, description="Run lighting/colour enhancement (background removal and framing always run)"),
+    authorization: str | None = Header(default=None, include_in_schema=False),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
@@ -462,7 +508,7 @@ async def enhance_image(
         result: Dict[str, Any] = await process_image_pipeline(
             image_bytes=image_bytes,
             output_format=output_format,
-            enhance=True,
+            enhance=enhance,
         )
     except ValueError as ve:
         # Pipeline validation error (decode, dimensions, format) — map to 400
@@ -504,6 +550,8 @@ async def enhance_image(
         logger.error("Failed to extract pipeline result: %s", exc, exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to process pipeline result: {exc}") from exc
 
+    background_removed = bool(result.get("background_removed", False))
+
     # ── STORAGE: generate random UUID paths (never use filename) ────────
     bucket = _get_bucket_name()
     base = f"{artisan_id_str}/{uuid.uuid4().hex}"
@@ -515,71 +563,76 @@ async def enhance_image(
     logger.info("Uploading to bucket=%s base=%s", bucket, base)
 
     # ── UPLOAD (original + enhanced PNG + WebP + thumbnail) ──────────────
-    # Original
-    try:
-        original_ct = MIME_TO_CONTENT_TYPE.get(ext_original, "image/jpeg")
-        original_url = _upload_bytes_with_fallback(bucket, original_path, image_bytes, original_ct)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error("Original upload failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to upload original: {exc}") from exc
+    uploads = [
+        ("original", original_path, image_bytes, MIME_TO_CONTENT_TYPE.get(ext_original, "image/jpeg")),
+        ("enhanced PNG", enhanced_png_path, enhanced_bytes, "image/png"),
+        ("enhanced WebP", enhanced_webp_path, webp_bytes, "image/webp"),
+        ("thumbnail", thumb_path, thumbnail_bytes, "image/webp"),
+    ]
+    is_supabase_user = current_user.get("auth_provider") == "supabase"
 
-    # Enhanced PNG
-    try:
-        enhanced_png_url = _upload_bytes_with_fallback(bucket, enhanced_png_path, enhanced_bytes, "image/png")
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error("Enhanced PNG upload failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to upload enhanced PNG: {exc}") from exc
+    if is_supabase_user:
+        # Upload as the user: storage RLS lets them write only under their own auth-uid folder,
+        # which is artisan_id_str for Supabase users. No mock URLs — if storage rejects the
+        # upload, the result is returned inline below instead.
+        import asyncio
 
-    # Enhanced WebP (preferred)
-    try:
-        enhanced_webp_url = _upload_bytes_with_fallback(bucket, enhanced_webp_path, webp_bytes, "image/webp")
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error("Enhanced WebP upload failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to upload enhanced WebP: {exc}") from exc
+        urls = None
+        scheme, _, access_token = (authorization or "").partition(" ")
+        access_token = access_token.strip()
+        if scheme.lower() == "bearer" and access_token:
+            urls = await asyncio.to_thread(
+                _upload_as_user, bucket, access_token, [(path, data, ct) for _, path, data, ct in uploads]
+            )
+        storage_uploaded = urls is not None
+    else:
+        urls = []
+        for label, path, data, content_type in uploads:
+            try:
+                urls.append(_upload_bytes_with_fallback(bucket, path, data, content_type))
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.error("%s upload failed: %s", label, exc, exc_info=True)
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to upload {label}: {exc}") from exc
+        storage_uploaded = True
 
-    # Thumbnail
-    try:
-        thumbnail_url = _upload_bytes_with_fallback(bucket, thumb_path, thumbnail_bytes, "image/webp")
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error("Thumbnail upload failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to upload thumbnail: {exc}") from exc
-
+    original_url, enhanced_png_url, enhanced_webp_url, thumbnail_url = urls if urls else (None, None, None, None)
     # Prefer WebP for enhanced_url
     enhanced_url = enhanced_webp_url or enhanced_png_url
+    if not storage_uploaded:
+        enhanced_url = "data:image/webp;base64," + base64.b64encode(webp_bytes).decode("ascii")
 
     logger.info(
-        "Enhance success artisan=%s %dx%d ratio=%s original=%s enhanced=%s thumb=%s",
+        "Enhance success artisan=%s %dx%d ratio=%s background_removed=%s stored=%s",
         artisan_id_str,
         width,
         height,
         ratio,
-        original_url,
-        enhanced_url,
-        thumbnail_url,
+        background_removed,
+        storage_uploaded,
     )
 
     # ── RESPONSE ─────────────────────────────────────────────────────────
+    payload = {
+        "original_url": original_url,
+        "enhanced_url": enhanced_url,
+        "enhanced_png_url": enhanced_png_url,
+        "enhanced_webp_url": enhanced_webp_url,
+        "thumbnail_url": thumbnail_url,
+        "width": width,
+        "height": height,
+        "ratio": ratio,
+        "bucket": bucket,
+        "background_removed": background_removed,
+        "storage_uploaded": storage_uploaded,
+    }
     return JSONResponse(
         status_code=status.HTTP_200_OK,
         content={
             "success": True,
-            "original_url": original_url,
-            "enhanced_url": enhanced_url,
-            "enhanced_png_url": enhanced_png_url,
-            "enhanced_webp_url": enhanced_webp_url,
-            "thumbnail_url": thumbnail_url,
-            "width": width,
-            "height": height,
-            "ratio": ratio,
-            "bucket": bucket,
+            "message": "Image enhanced" if storage_uploaded else "Image enhanced (storage upload failed — image returned inline)",
+            **payload,
             # Also include paths for debugging/audit (not required but helpful)
             "paths": {
                 "original": original_path,
@@ -587,5 +640,8 @@ async def enhance_image(
                 "enhanced_webp": enhanced_webp_path,
                 "thumbnail": thumb_path,
             },
+            # Same fields in the {success, message, data} envelope the mobile client parses.
+            # Keep it flat: Android reads data as Map<String, String>.
+            "data": payload,
         },
     )

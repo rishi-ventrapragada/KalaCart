@@ -397,6 +397,10 @@ async def get_optional_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     # SECURITY: never log `token` itself
+    from app.core.supabase_auth import is_supabase_token, supabase_user_context, verify_supabase_token
+
+    if is_supabase_token(token):
+        return supabase_user_context(verify_supabase_token(token))
     claims = verify_firebase_token(token)
     uid = claims.get("uid")
     # Best-effort artisan fetch (optional for pricing personalization)
@@ -457,6 +461,12 @@ async def get_current_user(
             detail="Empty Bearer token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    # Supabase Auth access token (mobile app email login) — verified against the project's signing keys
+    from app.core.supabase_auth import is_supabase_token, supabase_user_context, verify_supabase_token
+
+    if is_supabase_token(id_token):
+        return supabase_user_context(verify_supabase_token(id_token))
 
     # Verify token
     claims = verify_firebase_token(id_token)

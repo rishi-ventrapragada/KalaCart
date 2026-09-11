@@ -3,8 +3,9 @@ Vision Pipeline — main async orchestrator for KalaCart image enhancement.
 
 Flow (as per spec):
   validate inputs -> decode cv2.imdecode -> EXIF rotation via PIL -> validate dims
-  100x100..6000x6000 -> background mask -> enhance (if enabled) -> compose on white
-  -> crop_to_ratio -> resize_to_target (1080) -> export PNG/WebP + thumbnail
+  100x100..6000x6000 -> background mask -> enhance (if enabled, metered on the product)
+  -> compose on white -> frame around the product (or centred crop_to_ratio)
+  -> resize_to_target (1080) -> export PNG/WebP + thumbnail
 
 Exports:
   async def process_image_pipeline(image_bytes: bytes, output_format: str="1:1",
@@ -12,15 +13,17 @@ Exports:
 
 Return dict keys:
   original_bytes, enhanced_bytes (PNG), webp_bytes, thumbnail_bytes (WebP 256),
-  width, height
+  width, height, ratio, background_removed
 
 Fallback: if background removal fails, just enhance without removal.
 All errors are caught and re-raised as ValueError with clear message for API layer.
+The CPU-bound work runs in a worker thread so the event loop keeps serving requests.
 No hardcoded secrets.
 """
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 from typing import Dict
@@ -205,43 +208,8 @@ def _make_thumbnail(img_bgr: np.ndarray, thumb_long: int = THUMB_SIZE) -> bytes:
     return _export_webp(thumb, quality=80)  # slightly lower quality for thumb
 
 
-async def process_image_pipeline(
-    image_bytes: bytes,
-    output_format: str = "1:1",
-    enhance: bool = True,
-) -> Dict:
-    """
-    Main pipeline — decode, validate, enhance, composite, crop, resize, export.
-
-    Args:
-        image_bytes: Raw uploaded image bytes (jpeg/png/webp).
-        output_format: "1:1" or "4:5" (output aspect).
-        enhance: Whether to run enhancement chain (default True).
-
-    Returns:
-        dict with keys:
-            original_bytes: bytes (original decoded re-encoded? we return input bytes prefixed? spec says original_bytes —
-                we return the input image_bytes as-is for storage caller to use)
-            enhanced_bytes: bytes (PNG, full resolution 1080 target)
-            webp_bytes: bytes (WebP quality 85, same resolution)
-            thumbnail_bytes: bytes (WebP small ~256 long edge)
-            width: int
-            height: int
-            ratio: str  (echo of output_format)
-
-    Raises:
-        ValueError on validation / decode failure.
-
-    Note: This function is async for FastAPI compatibility but is CPU-bound.
-          Callers should run in threadpool (e.g., run_in_executor) if needed for large batches.
-    """
-    # ── Validate format ──────────────────────────────────────────
-    if output_format not in ALLOWED_FORMATS:
-        raise ValueError(f"Invalid output_format '{output_format}'. Allowed: {ALLOWED_FORMATS}")
-
-    if not image_bytes or len(image_bytes) == 0:
-        raise ValueError("Empty image bytes — upload a valid image")
-
+def _run_pipeline(image_bytes: bytes, output_format: str, enhance: bool) -> Dict:
+    """Synchronous pipeline body (CPU-bound). Called by process_image_pipeline in a worker thread."""
     # Preserve original bytes as-is for return (caller may store original separately)
     original_bytes = image_bytes
 
@@ -249,8 +217,6 @@ async def process_image_pipeline(
     img = _decode_image(image_bytes)
     _validate_dimensions(img)
 
-    # Keep a copy for fallback paths
-    original_decoded = img.copy()
     h0, w0 = img.shape[:2]
     logger.info("Pipeline start: %dx%d format=%s enhance=%s bytes=%d", w0, h0, output_format, enhance, len(image_bytes))
 
@@ -281,13 +247,13 @@ async def process_image_pipeline(
         mask_success = False
 
     # ── Enhance (if enabled) ─────────────────────────────────────
+    # With a mask, exposure is metered on the product and white balance is read from the background
     enhanced_fg = img
     if enhance:
         try:
             from app.vision.enhance import enhance_image as _enhance
 
-            # Apply enhancement on the decoded image (before compositing, so enhancement improves fg)
-            enhanced_fg = _enhance(img)
+            enhanced_fg = _enhance(img, mask=mask if mask_success else None)
             logger.debug("Enhancement succeeded")
         except Exception as exc:
             logger.warning("Enhancement step failed (%s) — using original", exc)
@@ -306,18 +272,20 @@ async def process_image_pipeline(
         except Exception as exc:
             logger.warning("Compose failed (%s) — using enhanced image without removal", exc)
             composited = enhanced_fg.copy()
-    else:
-        # No mask: optionally still ensure image is on white if it had transparency? Not needed.
-        # If enhance was applied, composited already holds enhanced_fg which is ready.
-        pass
+            mask_success = False
 
-    # ── Crop to ratio ────────────────────────────────────────────
+    # ── Frame: around the product when isolated, otherwise centred crop ─
     try:
-        from app.vision.compose import crop_to_ratio as _crop
+        if mask_success and mask is not None:
+            from app.vision.compose import crop_to_subject as _frame
 
-        composited = _crop(composited, ratio=output_format)
+            composited = _frame(composited, mask, ratio=output_format)
+        else:
+            from app.vision.compose import crop_to_ratio as _crop
+
+            composited = _crop(composited, ratio=output_format)
     except Exception as exc:
-        logger.warning("crop_to_ratio failed (%s) — skipping crop", exc)
+        logger.warning("Framing failed (%s) — skipping crop", exc)
 
     # ── Resize to target 1080 ────────────────────────────────────
     try:
@@ -328,7 +296,7 @@ async def process_image_pipeline(
         logger.warning("resize_to_target failed (%s) — using cropped image", exc)
 
     width, height = composited.shape[1], composited.shape[0]
-    logger.info("Pipeline result: %dx%d (format %s)", width, height, output_format)
+    logger.info("Pipeline result: %dx%d (format %s, background_removed=%s)", width, height, output_format, mask_success)
 
     # ── Export: PNG, WebP, thumbnail ─────────────────────────────
     try:
@@ -363,4 +331,43 @@ async def process_image_pipeline(
         "width": width,
         "height": height,
         "ratio": output_format,
+        "background_removed": mask_success,
     }
+
+
+async def process_image_pipeline(
+    image_bytes: bytes,
+    output_format: str = "1:1",
+    enhance: bool = True,
+) -> Dict:
+    """
+    Main pipeline — decode, validate, remove background, enhance, frame, resize, export.
+
+    Args:
+        image_bytes: Raw uploaded image bytes (jpeg/png/webp).
+        output_format: "1:1" or "4:5" (output aspect).
+        enhance: Whether to run enhancement chain (default True).
+
+    Returns:
+        dict with keys:
+            original_bytes: bytes (the input image_bytes as-is, for storage caller to use)
+            enhanced_bytes: bytes (PNG, full resolution 1080 target)
+            webp_bytes: bytes (WebP quality 85, same resolution)
+            thumbnail_bytes: bytes (WebP small ~256 long edge)
+            width: int
+            height: int
+            ratio: str  (echo of output_format)
+            background_removed: bool (False when no clean subject/background split was found)
+
+    Raises:
+        ValueError on validation / decode failure.
+    """
+    # ── Validate format ──────────────────────────────────────────
+    if output_format not in ALLOWED_FORMATS:
+        raise ValueError(f"Invalid output_format '{output_format}'. Allowed: {ALLOWED_FORMATS}")
+
+    if not image_bytes or len(image_bytes) == 0:
+        raise ValueError("Empty image bytes — upload a valid image")
+
+    # OpenCV work is CPU-bound — run it off the event loop so other requests aren't blocked
+    return await asyncio.to_thread(_run_pipeline, image_bytes, output_format, enhance)

@@ -55,8 +55,20 @@ class Settings(BaseSettings):
     # ── AI / OpenRouter ──────────────────────────────────────────────
     OPENROUTER_API_KEY: Optional[str] = Field(default=None, description="OpenRouter API key")
     OPENROUTER_BASE_URL: str = Field(default="https://openrouter.ai/api/v1")
-    QWEN_MODEL: str = Field(default="qwen/qwen3-32b")
+    # Text and vision models are held to OpenRouter ":free" slugs by decision D-9.
+    # The AI-Features handover defaulted these to qwen/qwen3.6-flash and
+    # qwen/qwen3.7-flash, which are paid; those defaults were not adopted.
+    # Both slugs below are free and vision-capable, and are the same models the
+    # agent's fallback walker ranks first (app/agent/models.py).
+    QWEN_MODEL: str = Field(default="google/gemma-4-31b-it:free")
     DEEPSEEK_MODEL: str = Field(default="deepseek/deepseek-chat")
+    # Image-capable model that reads product photos for the pricing assistant
+    VISION_MODEL: str = Field(default="google/gemma-4-31b-it:free")
+
+    # ── Speech-to-text / Sarvam AI (voice notes in Indian languages) ─
+    SARVAM_API_KEY: Optional[str] = Field(default=None, description="Sarvam AI API subscription key")
+    SARVAM_BASE_URL: str = Field(default="https://api.sarvam.ai")
+    SARVAM_STT_MODEL: str = Field(default="saaras:v3", description="Sarvam speech-to-text model")
 
     # ── Misc ─────────────────────────────────────────────────────────
     RATE_LIMIT_PER_MINUTE: int = Field(default=60, description="API rate limit")

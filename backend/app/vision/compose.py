@@ -247,6 +247,63 @@ def crop_to_ratio(img: np.ndarray, ratio: str = "1:1") -> np.ndarray:
         return img.copy()
 
 
+def crop_to_subject(
+    img: np.ndarray,
+    mask: np.ndarray,
+    ratio: str = "1:1",
+    margin: float = 0.10,
+) -> np.ndarray:
+    """
+    Frame the product: crop to the target ratio around the mask's bounding box, leaving
+    `margin` of empty space on the tighter side, and pad with white where the frame
+    extends past the photo. Intended for images already composed on white.
+
+    Falls back to crop_to_ratio when the mask is missing, mismatched or empty.
+
+    Args:
+        img: BGR uint8 image (H x W x 3), background already white.
+        mask: Single-channel uint8 mask (H x W), 255 = product.
+        ratio: "1:1" or "4:5".
+        margin: Fraction of the frame kept empty on each side of the product (0-0.4).
+
+    Returns:
+        BGR image with aspect exactly target (within 1px).
+    """
+    if img is None or not isinstance(img, np.ndarray) or img.size == 0:
+        raise ValueError("crop_to_subject: img is None/empty")
+    if img.ndim != 3 or img.shape[2] != 3:
+        raise ValueError(f"crop_to_subject: expected BGR 3-channel, got shape {img.shape}")
+    if ratio not in ALLOWED_RATIOS:
+        raise ValueError(f"Unsupported ratio '{ratio}'. Allowed: {ALLOWED_RATIOS}")
+
+    h, w = img.shape[:2]
+    if mask is None or not isinstance(mask, np.ndarray) or mask.shape[:2] != (h, w):
+        return crop_to_ratio(img, ratio)
+    ys, xs = np.nonzero(mask > 127)
+    if xs.size == 0:
+        return crop_to_ratio(img, ratio)
+
+    aspect = RATIO_ASPECT[ratio]
+    fill = 1.0 - 2.0 * float(max(0.0, min(0.4, margin)))
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+
+    # Frame height that fits the product at `fill` in both dimensions — but never tiny,
+    # so a small detected region isn't blown up into a blurry close-up
+    frame_h = int(round(max((y1 - y0) / fill, (x1 - x0) / fill / aspect, 0.4 * min(h, w))))
+    frame_w = max(1, int(round(frame_h * aspect)))
+
+    left = int(round((x0 + x1) / 2.0 - frame_w / 2.0))
+    top = int(round((y0 + y1) / 2.0 - frame_h / 2.0))
+
+    canvas = np.full((frame_h, frame_w, 3), 255, dtype=np.uint8)
+    sx0, sy0 = max(0, left), max(0, top)
+    sx1, sy1 = min(w, left + frame_w), min(h, top + frame_h)
+    if sx1 > sx0 and sy1 > sy0:
+        canvas[sy0 - top : sy1 - top, sx0 - left : sx1 - left] = img[sy0:sy1, sx0:sx1]
+    return canvas
+
+
 def resize_to_target(img: np.ndarray, target: int = 1080) -> np.ndarray:
     """
     Resize image to studio target resolution while preserving aspect.
