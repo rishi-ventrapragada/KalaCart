@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     # ── AI / OpenRouter ──────────────────────────────────────────────
     OPENROUTER_API_KEY: Optional[str] = Field(default=None, description="OpenRouter API key")
     OPENROUTER_BASE_URL: str = Field(default="https://openrouter.ai/api/v1")
-    # Text and vision models are held to OpenRouter ":free" slugs by decision D-9.
+    # Text and vision models are held to OpenRouter ":free" slugs by decision D-13.
     # The AI-Features handover defaulted these to qwen/qwen3.6-flash and
     # qwen/qwen3.7-flash, which are paid; those defaults were not adopted.
     # Both slugs below are free and vision-capable, and are the same models the

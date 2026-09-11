@@ -1,7 +1,7 @@
 """
 KalaCart unified artisan agent — SUPERSEDED, not mounted.
 
-Status (decision D-10, 2026-09-11): this package is kept for reference and is
+Status (decision D-14, 2026-09-11): this package is kept for reference and is
 NOT part of the live request path. `app/main.py` deliberately leaves its router
 unmounted. The three artisan AI features are served by the dedicated endpoints:
 
@@ -19,7 +19,7 @@ equivalent anywhere else in the codebase and is the reason the text and vision
 models cost nothing per token. `app/core/config.py` now points the live
 endpoints at the same free slugs this walker ranks first.
 
-Do not re-mount without revisiting D-10 — doing so restores a second,
+Do not re-mount without revisiting D-14 — doing so restores a second,
 competing implementation of the same three features.
 """
 
