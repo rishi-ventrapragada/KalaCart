@@ -16,10 +16,11 @@ import urllib.error
 import urllib.request
 
 URL = "https://imprsuvtgqxepwzimqmc.supabase.co"
-ANON = (
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImltcHJzdXZ0Z3F4ZXB3emltcW1jIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgzNDQwNDcsImV4cCI6MjEwMzkyMDA0N30."
-    "X3O64LYKN1pJp5_ZTo-U56vqqI8Qq01a8GIWYYDl8pA"
-)
+# Publishable key, same one the app ships (lib/core/config/supabase_config.dart).
+# Was the legacy anon JWT, which stops working once the legacy JWT-based keys are
+# disabled -- and they have to be disabled together with the exposed service_role
+# key, since one shared secret signs both.
+ANON = "sb_publishable_knkWRgPGlMOSU6XX31Kgbg_MlGxUzon"
 PASSWORD = "KalaCart@2026"
 BUYER = {"email": "demo.buyer@kalacart.in", "full_name": "Priya Sundaram", "role": "buyer",
          "city": "Bengaluru", "state": "Karnataka", "phone": "+91 98450 11223"}

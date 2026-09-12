@@ -12,7 +12,7 @@ Future<void> main() async {
   try {
     await Supabase.initialize(
       url: SupabaseConfig.supabaseUrl,
-      publishableKey: SupabaseConfig.supabaseAnonKey,
+      publishableKey: SupabaseConfig.supabasePublishableKey,
     );
   } catch (e, s) {
     // Initialization only touches local storage; failing here means the app
