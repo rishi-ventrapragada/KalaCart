@@ -1,5 +1,8 @@
 # Render Blueprint for the KalaCart FastAPI backend.
 #
+# Must live at the REPOSITORY ROOT: Render only auto-detects render.yaml here.
+# The paths below are therefore relative to the repo root, not to backend/.
+#
 # Secrets are NOT here. Every value below is non-sensitive. The four secrets
 # (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_KEY, OPENROUTER_API_KEY)
 # are marked sync:false, which tells Render to prompt for them in the dashboard
