@@ -45,6 +45,18 @@ opencv-python-headless==4.12.0.88
 # different versions and the mismatch only appeared on a fresh build.
 numpy==2.2.6
 
+# PDF / QR generation
+# All three were imported by app/ but never declared -- requirements.txt had
+# drifted from the code. reportlab is imported at MODULE level in
+# app/api/business_suite.py and app/services/*_pdf.py (20 sites), so its absence
+# killed the worker at boot on Render. qrcode and redis are imported inside
+# functions, so they failed only when those code paths ran -- quieter, but still
+# broken in production.
+# All three are pure-Python wheels (py3-none-any): nothing compiles on the builder.
+reportlab==4.2.5          # needs pillow>=9.0.0; satisfied by pillow 10.3.0 above
+qrcode[pil]==7.4.2        # [pil] extra: storefront.py calls img.save(..., format="PNG")
+redis==5.0.8              # app/core/redis.py imports redis.asyncio
+
 # Utils
 gunicorn==22.0.0
 
