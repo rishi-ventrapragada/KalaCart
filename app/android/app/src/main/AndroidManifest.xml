@@ -1,4 +1,16 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Required for Supabase and the FastAPI backend. Only the Flutter-generated
+         debug/profile manifests declared this, so release builds had no network. -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- Photo capture for the AI catalog studio (image_picker) -->
+    <uses-permission android:name="android.permission.CAMERA"/>
+    <!-- On-device speech-to-text for voice listing (speech_to_text) -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService"/>
+        </intent>
+    </queries>
     <application
         android:label="kalacart"
         android:name="${applicationName}"
