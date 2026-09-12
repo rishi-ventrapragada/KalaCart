@@ -50,7 +50,10 @@ class SellerStorefront {
       artisanName: (profile?['full_name'] as String?) ?? 'Master Artisan',
       artisanType: row['artisan_type'] as String?,
       bio: row['bio'] as String?,
-      location: row['location'] as String?,
+      // Not row['location']: that column is PostGIS geometry, so casting it to
+      // String throws once a row actually holds a point. city/state below carry
+      // the place text.
+      location: null,
       city: profile?['city'] as String?,
       state: profile?['state'] as String?,
       avatarUrl: (profile?['avatar_url'] as String?) ?? profile?['profile_photo'] as String?,
@@ -67,7 +70,8 @@ class SellersRepository {
   SellersRepository(this._client);
 
   static const _select =
-      'id, profile_id, shop_name, artisan_type, bio, location, experience, created_at, profiles(full_name, city, state, avatar_url, profile_photo, is_verified)';
+      // `location` is not selected: it is PostGIS geometry and nothing reads it.
+      'id, profile_id, shop_name, artisan_type, bio, experience, created_at, profiles(full_name, city, state, avatar_url, profile_photo, is_verified)';
 
   Future<SellerStorefront?> getById(String sellerId) async {
     final row = await _client.from('sellers').select(_select).eq('id', sellerId).maybeSingle();
@@ -87,11 +91,14 @@ class SellersRepository {
     required String location,
     int? experienceYears,
   }) async {
+    // `location` is accepted for call-site compatibility but not written:
+    // sellers.location is a PostGIS geometry column and a plain place name
+    // fails it with "parse error - invalid geometry". Place text belongs on
+    // profiles.city / profiles.state.
     await _client.from('sellers').update({
       'shop_name': shopName.trim(),
       'artisan_type': artisanType,
       'bio': bio.trim(),
-      'location': location.trim(),
       if (experienceYears != null) 'experience': experienceYears,
     }).eq('id', sellerId);
   }

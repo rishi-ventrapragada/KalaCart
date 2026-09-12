@@ -132,7 +132,9 @@ class Product {
       sellerShopName: seller?['shop_name'] as String?,
       sellerArtisanType: seller?['artisan_type'] as String?,
       sellerBio: seller?['bio'] as String?,
-      sellerLocation: seller?['location'] as String?,
+      // sellers.location is PostGIS geometry, not text -- an `as String?` cast
+      // throws on a populated row. Place text lives on profiles.city/state.
+      sellerLocation: null,
     );
   }
 

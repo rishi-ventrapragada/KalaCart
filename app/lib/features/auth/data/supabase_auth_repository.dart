@@ -170,7 +170,11 @@ class SupabaseAuthRepository implements AuthRepository {
       shopName: seller?['shop_name'] as String?,
       artisanType: seller?['artisan_type'] as String?,
       bio: seller?['bio'] as String?,
-      sellerLocation: seller?['location'] as String?,
+      // sellers.location is PostGIS geometry, so it is never a String -- an
+      // `as String?` cast on a populated row would throw. Nothing writes it
+      // any more; place text lives on profiles.city/state, which regionLabel
+      // renders and the UI already falls back to.
+      sellerLocation: null,
     );
   }
 
@@ -299,11 +303,15 @@ class SupabaseAuthRepository implements AuthRepository {
       'role': UserAccountType.artisan.dbValue,
     }).eq('auth_user_id', authUser.id);
 
+    // `location` is deliberately not written. sellers.location is a PostGIS
+    // geometry column, so posting the typed village string into it fails with
+    // "parse error - invalid geometry" and the whole onboarding save is lost.
+    // The text is not dropped: splitLocation() above already stored it as
+    // profiles.city / profiles.state, which is what regionLabel renders.
     final sellerPayload = {
       'shop_name': data.storefrontName.trim(),
       'artisan_type': data.craftCategory,
       'bio': data.bio.trim(),
-      'location': data.villageLocation.trim(),
     };
 
     final existing = await _client.from('sellers').select('id').eq('profile_id', profileId).maybeSingle();
