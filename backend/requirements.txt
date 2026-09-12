@@ -7,7 +7,14 @@ python-multipart==0.0.9
 python-dotenv==1.0.1
 
 # Database & Supabase
-supabase==2.7.1
+# 2.16.0, not 2.7.1 (the old pin, which the local env had drifted from) and not
+# 2.31.0 (latest). 2.17.0+ pulls realtime>=2.11.7's pydantic requirement, which
+# conflicts with the pinned pydantic==2.6.3 and would cascade into fastapi and
+# openai. 2.16.0 is the highest version that resolves against pydantic 2.6.3.
+# It passes the API key through as an opaque header -- no JWT parsing anywhere in
+# the package -- so it accepts the new sb_secret_ key format as well as legacy
+# service_role JWTs.
+supabase==2.16.0
 psycopg2-binary==2.9.9
 sqlalchemy==2.0.29
 alembic==1.13.1
