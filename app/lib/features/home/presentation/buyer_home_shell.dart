@@ -92,6 +92,11 @@ class BuyerHomeShell extends ConsumerWidget {
         ),
         actions: [
           IconButton(
+            icon: const Icon(Icons.auto_awesome),
+            tooltip: 'AI Studio',
+            onPressed: () => context.push('/ai-studio'),
+          ),
+          IconButton(
             tooltip: 'Cart',
             onPressed: () => context.push('/cart'),
             icon: Badge(

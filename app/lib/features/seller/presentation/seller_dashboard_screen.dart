@@ -166,6 +166,11 @@ class _SellerDashboardScreenState extends ConsumerState<SellerDashboardScreen> {
         ),
         actions: [
           IconButton(
+            icon: const Icon(Icons.auto_awesome),
+            tooltip: 'AI Studio',
+            onPressed: () => context.push('/ai-studio'),
+          ),
+          IconButton(
             icon: const Icon(Icons.share_outlined),
             tooltip: 'Share Storefront Link',
             onPressed: () => _copyStorefrontLink(user?.sellerId),

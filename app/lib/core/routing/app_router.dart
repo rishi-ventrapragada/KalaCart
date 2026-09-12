@@ -11,6 +11,7 @@ import '../../features/auth/presentation/forgot_password_screen.dart';
 import '../../features/auth/presentation/login_screen.dart';
 import '../../features/auth/presentation/reset_password_screen.dart';
 import '../../features/auth/presentation/signup_screen.dart';
+import '../../features/ai/presentation/ai_studio_screen.dart';
 import '../../features/catalog_studio/presentation/catalog_studio_screen.dart';
 import '../../features/catalog_studio/presentation/product_creation_wizard_screen.dart';
 import '../../features/catalog_studio/presentation/seller_catalog_screen.dart';
@@ -357,6 +358,12 @@ final routerProvider = Provider<GoRouter>((ref) {
         path: '/catalog-studio/ai',
         parentNavigatorKey: _rootNavigatorKey,
         builder: (context, state) => const CatalogStudioScreen(),
+      ),
+      GoRoute(
+        // The three live AI features against the real backend.
+        path: '/ai-studio',
+        parentNavigatorKey: _rootNavigatorKey,
+        builder: (context, state) => const AiStudioScreen(),
       ),
       GoRoute(
         path: '/catalog-studio/create',
