@@ -17,12 +17,21 @@ class WholesaleTier {
 ///
 /// The buyer catalogue is `status = 'approved' AND is_active = true`.
 ///
-/// Note what the live database actually does, which differs from the intent
-/// documented in CLAUDE.md section 6: products.status defaults to 'approved',
-/// and an INSERT that sends 'pending' is stored as 'approved' anyway. Only a
-/// later UPDATE preserves 'pending'. So new listings currently go straight to
-/// buyers with no review step. Restoring the intended moderation gate means
-/// changing the column default server-side; it cannot be done from the client.
+/// THERE IS NO REVIEW GATE TODAY, despite what CLAUDE.md section 6 describes.
+/// Measured against the live project:
+///
+///   INSERT status='pending'  -> stored 'approved'   <-- rewritten
+///   INSERT status='rejected' -> stored 'rejected'
+///   INSERT status='approved' -> stored 'approved'
+///   UPDATE ...  ='pending'   -> stored 'pending'
+///
+/// Only 'pending' is rewritten, and only on INSERT, so this is server-side
+/// behaviour on the products table rather than a plain column default. The
+/// effect is that a seller tapping Publish reaches buyers immediately with no
+/// moderation step. Nothing in this repository can change that from the client:
+/// it needs the server-side rule dropped, plus an actual approval mechanism
+/// (the web admin declares getPendingProducts/setProductStatus but its provider
+/// is still the mock). Tracked as D-15 in memory/decisions.md.
 const String kBuyerVisibleStatus = 'approved';
 
 /// Seller-facing product state.

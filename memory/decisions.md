@@ -131,6 +131,54 @@ model catalogue and `complete()` fallback walker, which exists nowhere else and 
 D-13 affordable. Re-mounting reopens this decision.
 Status: active.
 
+### D-15 · 2026-09-12 · Product status maps onto pending/approved/rejected, and there is no review gate
+Source: `app/lib/shared/models/product.dart` (`ProductStatus.dbValue`, `kBuyerVisibleStatus`);
+`app/lib/features/products/data/supabase_products_repository.dart`.
+Reasoning: every product save failed. `products.status` carries a CHECK constraint accepting only
+`pending`, `approved` and `rejected`, and the client wrote `published`/`draft`/`archived`, so each
+insert raised 23514. The enum keeps its seller-facing names because the catalogue UI is built on
+them; only `dbValue` changes. `archived` is carried by `is_active = false`, since the constraint has
+no term for it. Buyer-facing queries filter on `kBuyerVisibleStatus` ('approved') rather than on
+what sellers write, so unreviewed listings are not shown.
+
+This resolves the *encoding* half of the D-10/D-12 conflict that PRD §8 records. It does not
+resolve the *product* half. Measured against the live project on 2026-09-12:
+
+    INSERT status='pending'  -> stored 'approved'   (rewritten)
+    INSERT status='rejected' -> stored 'rejected'
+    INSERT status='approved' -> stored 'approved'
+    UPDATE ...  ='pending'   -> stored 'pending'
+
+Only `pending` is rewritten, and only on INSERT, so this is server-side behaviour on the table, not
+a plain column default. A seller tapping Publish therefore reaches buyers immediately, with no
+moderation step — D-10/D-12's ministry-approval gate does not exist in any running form. The web
+admin declares `getPendingProducts` / `setProductStatus` in `src/lib/data/types.ts`, but its
+provider is still `mockProvider`, so nothing implements them.
+
+Building the gate is a separate, unstarted task: drop the server-side rewrite so `pending` persists,
+then implement an approval mechanism and a surface to drive it. Writing the right string is not the
+same as having a review step, and this entry should not be read as closing that.
+Status: active. The missing approval gate is open work, not a decision.
+
+### D-16 · 2026-09-12 · Email confirmation is off in Supabase Auth — a development unblock, not an intended posture
+Source: Supabase dashboard (Authentication → Sign In / Providers → Email → "Confirm email" = off).
+Not expressible in this repository; recorded here because nothing in the code shows it.
+Reasoning: confirmation emails pointed at the project's default Site URL, `http://localhost:3000`,
+which nothing serves, so every new signup dead-ended on ERR_CONNECTION_REFUSED. The app defines no
+deep-link scheme and `signUp()` passes no `emailRedirectTo`, so there was no in-app landing place
+for the link either. Turning confirmation off unblocked account creation for testing in one step.
+
+The trade-off is real and is accepted only for development: anyone can now register with an email
+address they do not control, and `auth.users.email` is no longer evidence of anything. This must be
+turned back on before the app is exposed to real users, together with the deep-link work that gives
+the confirmation link somewhere to land (a `kalacart://` scheme in the Android manifest, an
+`emailRedirectTo` on signup, and the redirect allow-list in Supabase).
+
+Recorded after the fact: this was changed during a debugging exchange rather than through the
+plan-first process in CLAUDE.md §8, which is the reason it is written down here rather than left as
+a dashboard setting nobody can see from the code.
+Status: active, and intended to be reversed.
+
 ---
 
 ## Superseded (recorded so they are not re-adopted by accident)
@@ -181,7 +229,7 @@ Each of these will become a D-n entry when decided. Ordered as in PRD §7.
 
 ---
 
-## Pending rewrite — this file, CLAUDE.md and PRD.md (flagged 2026-09-11, not yet done)
+## Pending rewrite — this file, CLAUDE.md and PRD.md (flagged 2026-09-11, CLOSED 2026-09-12)
 
 These three documents moved into the consolidated repository on 2026-09-11 without being
 rewritten. They describe the Java/Android stack that the consolidation drops, so large parts of
@@ -206,3 +254,23 @@ Known-wrong, verified at relocation time:
 
 The rewrite is a separate task. Until it happens, prefer the code and this log over CLAUDE.md
 and PRD.md wherever they disagree.
+
+### Closed 2026-09-12
+
+CLAUDE.md and PRD.md were rewritten for the Flutter + FastAPI architecture on 2026-09-12. Every
+item listed above is resolved: both documents now describe `app/` (Flutter client, canonical) and
+`backend/` (FastAPI), record the fresh repository with no remote, drop the Android/Java
+conventions in favour of the Dart ones the code actually shows, note that the unified agent is
+unmounted per D-14, and carry PRD open items 1, 2 and 7 as resolved or void. The block is kept
+rather than deleted so the history reads correctly.
+
+This file itself was **not** rewritten and did not need to be — D-1 … D-14 are appended history and
+stay as written. Where the code has since outrun a decision, the conflict is recorded as an open
+item in PRD §8 rather than by editing the entry: most importantly D-10 and D-12 (the client now
+uses `published`/`draft`/`archived` with sellers self-publishing, and no ministry-approval gate
+exists), which needs a product decision before any superseding entry is written.
+
+Decisions currently living only in code comments, not yet as `D-n` entries — deliberate for now,
+and candidates for future entries: **speech-to-text moving on-device in the Flutter client**
+(`backend/.env.example`, Sarvam block) and **the D-13 model pinning fix** that repointed
+`DEEPSEEK_MODEL` from a paid slug to `google/gemma-4-31b-it:free` (`backend/app/core/config.py`).
