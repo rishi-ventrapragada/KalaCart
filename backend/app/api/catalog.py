@@ -5,8 +5,8 @@ POST /api/v1/catalog/generate
 - Auth required (Bearer Supabase / Firebase token via get_current_user)
 - Rate limit: 10 req / 60s per IP-or-artisan (in-memory window)
 - Input: transcript (5-1000 chars, control chars stripped), language te|hi|en|ta|kn
-- Calls OpenRouter QWEN_MODEL (default qwen/qwen3.6-flash) with catalog_system.md prompt, temperature 0.3,
-  max_tokens 1500, thinking disabled (with thinking on, Qwen 3 took ~60s and blew the timeout), timeout 45s
+- Calls OpenRouter QWEN_MODEL with catalog_system.md prompt, temperature 0.3,
+  max_tokens 3000, timeout 45s
 - Validates JSON schema, retry once on malformed, 502 on persistent failure
 - Never exposes OPENROUTER_API_KEY in response/logs
 
@@ -309,8 +309,11 @@ async def _call_openrouter(
         ],
         # Low temperature keeps materials and facts faithful to the transcript
         "temperature": 0.3,
-        # Devanagari is token-heavy; 800 truncated longer English + Hindi descriptions
-        "max_tokens": 1500,
+        # Devanagari is token-heavy; 800 truncated longer English + Hindi descriptions.
+        # Raised to 3000 for reasoning-capable free models: nex-n2.5-pro spends a variable
+        # 400-1400 tokens on hidden reasoning that counts against this budget, and when the
+        # budget runs out the response comes back finish_reason="length" with content=None.
+        "max_tokens": 3000,
         # "Thinking" adds hundreds of hidden tokens and tens of seconds without better listings
         "reasoning": {"enabled": False},
     }

@@ -66,7 +66,12 @@ class Settings(BaseSettings):
     # qwen/qwen3.7-flash, which are paid; those defaults were not adopted.
     # Both slugs below are free and vision-capable, and are the same models the
     # agent's fallback walker ranks first (app/agent/models.py).
-    QWEN_MODEL: str = Field(default="google/gemma-4-31b-it:free")
+    # Repointed 2026-09-12 from google/gemma-4-31b-it:free. That slug still exists and the
+    # key is valid and unbilled, but every request 429s: OpenRouter proxies it to Google AI
+    # Studio's *shared* free pool ("limit_source": "upstream_provider_shared_pool"), which is
+    # exhausted. The gate is per-model, not per-account, so another :free slug clears it.
+    # nex-n2.5-pro returns valid 7-field catalog JSON in hi/en/te at cost 0. Still D-13 compliant.
+    QWEN_MODEL: str = Field(default="nex-agi/nex-n2.5-pro:free")
     # Was "deepseek/deepseek-chat" — a PAID slug, and reachable: app/api/pricing.py
     # (_call_openrouter) and app/ai/pricing.py both send requests with it, so a
     # deployed backend would have billed the OpenRouter account on every pricing
