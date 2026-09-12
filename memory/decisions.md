@@ -181,6 +181,40 @@ Status: active, and intended to be reversed.
 
 ---
 
+### D-17 · 2026-09-12 · Catalog generation runs on nex-agi/nex-n2.5-pro:free, not the gemma slug
+Source: `backend/app/core/config.py` (`QWEN_MODEL`), `backend/app/api/catalog.py` (`max_tokens`).
+Reasoning: `/api/v1/catalog/generate` returned 502 for every request against the deployed backend.
+The cause was upstream and not the key. `OPENROUTER_API_KEY` is valid and unbilled (`/api/v1/key`
+reports `usage: 0`, `is_free_tier: true`), but OpenRouter proxies `google/gemma-4-31b-it:free` to
+Google AI Studio's *shared* free pool, which is exhausted; the error carries
+`"limit_source": "upstream_provider_shared_pool"` and HTTP 429, which `catalog.py` maps onto a 502
+for the caller. The gate is per-model, not per-account, so a different `:free` slug clears it.
+
+D-13 still holds: the replacement is a `:free` slug and measured cost is 0 after all testing. This
+entry does not supersede D-13, it is an instance of applying it.
+
+`max_tokens` 1500 -> 3000 because the model reasons before answering and ignores
+`"reasoning": {"enabled": false}`. Hidden reasoning (400-1400 tokens, variable per call) counts
+against the same budget, and on exhaustion the response returns `finish_reason: "length"` with
+`content: null`, which the parser then reports as malformed JSON.
+
+Verified against the live deployment after the Render auto-deploy on 2026-09-12:
+3/3 valid seven-field responses for en/hi/te, then 4/4 on a second pass at 20 s spacing,
+8-26 s per call, Devanagari present in `description_hi` every time.
+
+`VISION_MODEL` and `DEEPSEEK_MODEL` still point at the gemma slug and were deliberately left alone:
+`/pricing/analyze` is their only caller, and the client always sends category+size+quality+
+complexity, which skips the model call entirely. They will need the same treatment if anything ever
+calls the AI-extraction path.
+
+Operational note, not a decision: the free Render instance (512 MB, one worker) returned Render's own
+HTML 502 for ~60 s when four catalog calls were issued back to back with ~2 s spacing, `/health`
+included, then recovered unprompted. Spacing the same calls 20 s apart was clean. Treat rapid bursts
+against the free tier as a load limit of the deployment, not a fault in this path.
+Status: active.
+
+---
+
 ## Superseded (recorded so they are not re-adopted by accident)
 
 These were the rules of the 2026-09-01/02 system and are contradicted by the code as of 2026-09-11.
