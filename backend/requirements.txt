@@ -30,7 +30,20 @@ openai==1.30.0
 pillow==10.3.0
 # Headless build: same cv2 API without the GUI/X11 shared libraries, which are
 # useless in a container and add hundreds of MB to the image.
-opencv-python-headless==4.9.0.80
+#
+# 4.12.0.88, not 4.9.0.80. The 4.9 wheel's C extension is compiled against the
+# NumPy 1.x ABI (its binary references numpy.core.multiarray) but its metadata
+# only says numpy>=1.23.5 with NO upper bound -- it predates NumPy 2.0 and could
+# not exclude it. So a fresh install resolved numpy 2.x and cv2 died at import
+# with "numpy.core.multiarray failed to import", crashing the worker on boot.
+# 4.12.0.88 is built against the NumPy 2.x ABI and declares numpy>=2,<2.3.0, so
+# the pair cannot drift apart again.
+opencv-python-headless==4.12.0.88
+
+# Pinned explicitly even though opencv constrains it. numpy was previously an
+# unpinned transitive dependency, which is why local and production resolved
+# different versions and the mismatch only appeared on a fresh build.
+numpy==2.2.6
 
 # Utils
 gunicorn==22.0.0
