@@ -147,7 +147,10 @@ class TestAnalyzePrice:
             ({"quality": "gold"}, True, "image/jpeg", 422),
             ({"complexity": "9"}, True, "image/jpeg", 422),
             ({}, b"GIF89a", "image/gif", 400),
-            ({}, b"0" * (10 * 1024 * 1024 + 1), "image/jpeg", 413),
+            # pytest.param(id=...) keeps the 10 MB payload out of the test's node
+            # ID. Without it the generated ID embedded all 10,485,761 bytes, which
+            # made the ID multi-megabyte and errored at setup on Windows.
+            pytest.param({}, b"0" * (10 * 1024 * 1024 + 1), "image/jpeg", 413, id="oversized-photo"),
             ({"description": "hi"}, True, "image/jpeg", 422),
             ({"material_cost": "-5"}, True, "image/jpeg", 422),
         ],

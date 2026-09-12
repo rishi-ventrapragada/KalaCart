@@ -1,0 +1,36 @@
+# Keep secrets and local clutter out of the build context and the image.
+# The Dockerfile does `COPY . .`, so anything not excluded here ships to Fly.
+
+# Secrets -- these must never enter an image layer.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+firebase-service-account.json
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Tests are not needed at runtime and pull the image larger.
+tests/
+
+# Local tooling
+.git/
+.gitignore
+.vscode/
+.idea/
+*.md
+nginx/

@@ -26,9 +26,15 @@ class Settings(BaseSettings):
     DEBUG: bool = Field(default=False, description="Enable debug mode")
     API_V1_PREFIX: str = Field(default="/api/v1", description="API version prefix")
     SECRET_KEY: str = Field(default="change-me-in-production", description="JWT / signing secret")
-    CORS_ORIGINS: List[str] = Field(
-        default=["http://localhost:3000", "http://10.0.2.2:8000"],
-        description="Allowed CORS origins",
+    # Held as a raw string, NOT List[str]. pydantic-settings JSON-decodes complex
+    # types (list/dict) in the env source *before* field validators run, so a
+    # documented comma-separated value like "https://a.com,https://b.com" raised
+    # SettingsError at import and crashed startup. Parsing happens in the
+    # CORS_ORIGINS property below, which accepts both comma-separated and JSON.
+    CORS_ORIGINS_RAW: str = Field(
+        default="http://localhost:3000,http://10.0.2.2:8000",
+        alias="CORS_ORIGINS",
+        description="Allowed CORS origins — comma-separated or JSON array",
     )
 
     # ── Supabase ─────────────────────────────────────────────────────
@@ -61,7 +67,12 @@ class Settings(BaseSettings):
     # Both slugs below are free and vision-capable, and are the same models the
     # agent's fallback walker ranks first (app/agent/models.py).
     QWEN_MODEL: str = Field(default="google/gemma-4-31b-it:free")
-    DEEPSEEK_MODEL: str = Field(default="deepseek/deepseek-chat")
+    # Was "deepseek/deepseek-chat" — a PAID slug, and reachable: app/api/pricing.py
+    # (_call_openrouter) and app/ai/pricing.py both send requests with it, so a
+    # deployed backend would have billed the OpenRouter account on every pricing
+    # call. Repointed to the same free slug the other features use, per D-13.
+    # The env var still overrides if a paid model is ever deliberately chosen.
+    DEEPSEEK_MODEL: str = Field(default="google/gemma-4-31b-it:free")
     # Image-capable model that reads product photos for the pricing assistant
     VISION_MODEL: str = Field(default="google/gemma-4-31b-it:free")
 
@@ -89,24 +100,6 @@ class Settings(BaseSettings):
     )
 
     # ── Validators ───────────────────────────────────────────────────
-    @field_validator("CORS_ORIGINS", mode="before")
-    @classmethod
-    def _parse_cors_origins(cls, v):
-        """Allow CORS_ORIGINS as comma-separated string or JSON list."""
-        if isinstance(v, str):
-            # Handle comma-separated string from .env
-            if v.strip().startswith("["):
-                import json
-
-                try:
-                    parsed = json.loads(v)
-                    if isinstance(parsed, list):
-                        return parsed
-                except Exception:
-                    pass
-            return [origin.strip() for origin in v.split(",") if origin.strip()]
-        return v
-
     @field_validator("DEBUG", mode="before")
     @classmethod
     def _parse_debug(cls, v):
@@ -115,6 +108,32 @@ class Settings(BaseSettings):
         return v
 
     # ── Helpers ──────────────────────────────────────────────────────
+    @property
+    def CORS_ORIGINS(self) -> List[str]:
+        """
+        Allowed CORS origins, parsed from CORS_ORIGINS_RAW.
+
+        Accepts either a comma-separated string (the format documented in
+        .env.example) or a JSON array. Callers read settings.CORS_ORIGINS and
+        always get a list, so this is a drop-in for the former List[str] field.
+
+        Note: CORS is a browser policy. The Flutter/Android app sends no Origin
+        header and is unaffected by this list; it matters only for the web admin.
+        """
+        raw = (self.CORS_ORIGINS_RAW or "").strip()
+        if not raw:
+            return []
+        if raw.startswith("["):
+            import json
+
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return [str(o).strip() for o in parsed if str(o).strip()]
+            except Exception:
+                pass
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
     @property
     def supabase_service_key(self) -> Optional[str]:
         """Preferred privileged key — service_role falls back to anon key."""

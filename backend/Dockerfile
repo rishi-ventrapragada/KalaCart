@@ -44,9 +44,19 @@ COPY --chown=kalacart:kalacart . .
 
 USER kalacart
 
-EXPOSE 8000
+# Render injects PORT (its documented default is 10000); this ENV is the
+# fallback so `docker run` works locally with no PORT set.
+ENV PORT=10000
+
+EXPOSE 10000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8000/api/v1/health || exit 1
+    CMD curl -f http://localhost:${PORT}/api/v1/health || exit 1
 
-CMD ["gunicorn", "app.main:app", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000", "--access-logfile", "-", "--error-logfile", "-"]
+# -w 1, not 4: Render's free instance is 0.1 CPU / 512 MB. The app plus OpenCV
+# measures ~107 MB resident for a single worker, so four would not fit, and four
+# processes on a tenth of a CPU would contend rather than parallelise.
+# It is also more correct -- core/rate_limit.py keeps its counters in process
+# memory, so multiple workers would each enforce a separate, wrong quota.
+# Shell form so ${PORT} is expanded by the shell at runtime.
+CMD gunicorn app.main:app -w 1 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:${PORT} --access-logfile - --error-logfile -

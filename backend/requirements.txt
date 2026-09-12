@@ -28,7 +28,9 @@ openai==1.30.0
 
 # Image processing
 pillow==10.3.0
-opencv-python==4.9.0.80
+# Headless build: same cv2 API without the GUI/X11 shared libraries, which are
+# useless in a container and add hundreds of MB to the image.
+opencv-python-headless==4.9.0.80
 
 # Utils
 gunicorn==22.0.0
