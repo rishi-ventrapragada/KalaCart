@@ -21,7 +21,10 @@ class SupabaseProductsRepository {
         .from('products')
         .select(productSelect)
         .eq('is_active', true)
-        .eq('status', ProductStatus.published.dbValue);
+        // Buyers see only admin-approved listings. Not ProductStatus.published
+        // .dbValue: that writes 'pending', the state a seller's submission lands
+        // in. Filtering on it here would show buyers unreviewed products.
+        .eq('status', kBuyerVisibleStatus);
     if (category != null && category.isNotEmpty && category != 'All Crafts') {
       q = q.eq('category', category);
     }
@@ -62,7 +65,8 @@ class SupabaseProductsRepository {
         .select(productSelect)
         .eq('seller_id', sellerId)
         .eq('is_active', true)
-        .eq('status', ProductStatus.published.dbValue)
+        // Public storefront: approved listings only, same rule as the catalogue.
+        .eq('status', kBuyerVisibleStatus)
         .order('created_at', ascending: false);
     return _mapList(res);
   }

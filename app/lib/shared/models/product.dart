@@ -13,17 +13,56 @@ class WholesaleTier {
       );
 }
 
+/// products.status value a listing must hold to appear to buyers.
+///
+/// The buyer catalogue is `status = 'approved' AND is_active = true`.
+///
+/// Note what the live database actually does, which differs from the intent
+/// documented in CLAUDE.md section 6: products.status defaults to 'approved',
+/// and an INSERT that sends 'pending' is stored as 'approved' anyway. Only a
+/// later UPDATE preserves 'pending'. So new listings currently go straight to
+/// buyers with no review step. Restoring the intended moderation gate means
+/// changing the column default server-side; it cannot be done from the client.
+const String kBuyerVisibleStatus = 'approved';
+
+/// Seller-facing product state.
+///
+/// These names are the app's vocabulary and drive the catalogue UI (Save Draft
+/// vs Publish, the tabbed lists, the status chips). They are NOT what the
+/// database stores: products.status has a CHECK constraint accepting only
+/// 'pending', 'approved' and 'rejected', so writing 'published'/'draft'/
+/// 'archived' fails with 23514 and every product save is rejected.
+///
+/// The mapping is deliberately lossy in one direction. A seller "publishing" a
+/// product submits it for review -- it becomes `pending`, and only an admin
+/// moves it to `approved`. The app never writes `approved` itself
+/// (CLAUDE.md section 6). Archiving is carried by `is_active = false` rather
+/// than by a status value, since the constraint has no term for it.
 enum ProductStatus {
   published,
   draft,
   archived;
 
-  String get dbValue => name;
+  /// Value written to products.status.
+  ///
+  /// `draft` also maps to 'pending': the constraint offers nothing closer, and
+  /// is_active keeps drafts out of the buyer catalogue.
+  String get dbValue => switch (this) {
+        ProductStatus.published => 'pending',
+        ProductStatus.draft => 'pending',
+        ProductStatus.archived => 'pending',
+      };
 
-  static ProductStatus fromDb(String? value) => ProductStatus.values.firstWhere(
-        (s) => s.name == (value ?? '').toLowerCase(),
-        orElse: () => ProductStatus.draft,
-      );
+  static ProductStatus fromDb(String? value, {bool isActive = true}) {
+    if (!isActive) return ProductStatus.archived;
+    return switch ((value ?? '').toLowerCase()) {
+      // 'pending' and 'approved' are both live listings from the seller's point
+      // of view -- the difference is admin review, which the app does not model.
+      'approved' || 'pending' => ProductStatus.published,
+      'rejected' => ProductStatus.draft,
+      _ => ProductStatus.draft,
+    };
+  }
 }
 
 /// One row of `products` joined with its seller and wholesale tiers.
@@ -124,7 +163,11 @@ class Product {
       stock: (row['stock'] as num?)?.toInt() ?? 0,
       imageUrls: images,
       isActive: row['is_active'] as bool? ?? true,
-      status: ProductStatus.fromDb(row['status'] as String?),
+      // is_active carries "archived", which products.status has no term for.
+      status: ProductStatus.fromDb(
+        row['status'] as String?,
+        isActive: row['is_active'] as bool? ?? true,
+      ),
       city: row['city'] as String?,
       state: row['state'] as String?,
       createdAt: DateTime.tryParse(row['created_at']?.toString() ?? '') ?? DateTime.now(),
